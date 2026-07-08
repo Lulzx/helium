@@ -12,16 +12,18 @@ The whole system obeys five rules; every section below is a consequence of them.
    threads that block on a pipe or a socket and push events into the queue.
 2. **The engine is sans-IO.** The core is a pure state machine:
    `step(State, Event) -> Vec<Command>`. It never touches a process, socket, file, or clock —
-   time arrives as `Event::Tick`, randomness doesn't exist. IO lives in a thin shell that feeds
+   every event record carries its timestamp, and time reaches the engine *only* through
+   events (`Tick` included); randomness doesn't exist. IO lives in a thin shell that feeds
    events in and executes emitted commands. The engine is therefore deterministic, replayable,
    and testable at millions of steps per second with a fake clock.
 3. **The event log is the database.** Every event is appended to a JSONL log before it is
    applied. State is a fold over the log; restart = replay. There is no second store to drift
    out of sync. Snapshots are an optimization, added only if replay ever gets slow.
-4. **Own the protocols, shell out to the tools.** ACP is JSON-RPC over stdio — we implement the
-   client ourselves (~400 lines) rather than import an async ecosystem for it. Git and GitHub
-   are driven through the `git` and `gh` CLIs — stable, documented, battle-tested interfaces —
-   not through library bindings.
+4. **Canonical protocols, shelled-out tools.** ACP comes from the official
+   `agent-client-protocol` crate — Zed's own SDK, runtime-agnostic (futures-based, no tokio),
+   so it rides our edge threads without dragging in an async ecosystem, and spec drift is
+   tracked by the spec's authors. Git and GitHub are driven through the `git` and `gh` CLIs —
+   stable, documented, battle-tested interfaces — not through library bindings.
 5. **A dependency must pay rent.** GPUI + gpui-component are the point of the project (native
    cross-platform GPU UI) and are accepted. Beyond them the budget is small and enumerated
    (§3.7). Anything a competent programmer can write in a weekend at the size we need — HTTP/1.1
@@ -78,7 +80,7 @@ Two operating modes over one engine (Symphony-inspired):
 1. **Kanban board** of agent tasks (To do / In progress / In review / Done), one agent session per card.
 2. **Git worktree isolation** per task — each task gets its own worktree + branch; approve-and-merge when done.
 3. **Task detail view** — live agent transcript (streamed markdown), tool-call log, and a **diff tab** reviewing the worktree against the base branch.
-4. **ACP-native agent integration** — our own [Agent Client Protocol](https://agentclientprotocol.com) client; get Claude Code (via claude-code-acp), Gemini CLI, and every future ACP agent from a three-line TOML registry entry.
+4. **ACP-native agent integration** — the official [Agent Client Protocol](https://agentclientprotocol.com) SDK behind a thin adapter; get Claude Code (via claude-code-acp), Gemini CLI, and every future ACP agent from a three-line TOML registry entry.
 5. **Built-in Ollama agent** — a minimal native agent loop (read/write/edit/glob/grep/bash tools with permission gates) driving local models through the Ollama API, exposed through the same internal interface as ACP agents. Headline differentiator.
 6. **Permission modes** per task: Ask / Auto-edit / Full-auto, plus per-request approval dialogs surfaced from ACP `session/request_permission`.
 7. **Context attachment** on task creation: files and pasted text (symbols/commits later).
@@ -147,8 +149,10 @@ One binary. Threads, not runtimes:
 ### 3.2 The sans-IO core (`helium-core`)
 
 ```rust
-// The entire engine contract:
-pub fn step(state: &mut State, event: Event, now: Instant) -> Vec<Command>;
+// The entire engine contract. Time comes from the event, never from a clock —
+// an Instant/SystemTime parameter would be a replay-breaking side channel.
+pub struct Stamped { pub at_ms: u64, pub event: Event }   // what gets logged & applied
+pub fn step(state: &mut State, ev: &Stamped) -> Vec<Command>;
 
 pub enum Event {
     // user/UI intents (also arrive from the control socket)
@@ -161,8 +165,8 @@ pub enum Event {
     GitDone { task: TaskId, op: GitOp, result: Result<String, String> },
     GhDone { op: GhOp, result: Result<Json, String> },
     HookDone { task: TaskId, hook: String, code: i32, stderr: String },
-    Tick,                                                  // 1 Hz; drives timeouts, backoff, polls
-}
+    Tick,                                                  // 1 Hz; with Stamped.at_ms this is the
+}                                                          //   engine's only source of time
 
 pub enum Command {
     SpawnAgent { task: TaskId, runner: RunnerCfg, worktree: PathBuf },
@@ -177,9 +181,9 @@ pub enum Command {
 
 Consequences, all load-bearing:
 - **Every feature in §2.9–2.11 is pure code in `step()`**: the lifecycle machine, retry
-  backoff, stall detection (compare `last_activity` against `now` on `Tick`), rework cycles,
-  concurrency caps, tracker-poll scheduling. All of it unit-tests with synthetic events and a
-  fake clock — no processes, no git repos, no network.
+  backoff, stall detection (compare `last_activity_ms` against `Tick`'s `at_ms`), rework
+  cycles, concurrency caps, tracker-poll scheduling. All of it unit-tests with synthetic
+  events and fabricated timestamps — no processes, no git repos, no network, no clock.
 - **Replay is trivial**: `state = events.fold(State::default(), step_ignoring_commands)`.
   Startup, crash recovery, and "reopen a 3-week-old task" are the same code path.
 - **The control protocol falls out for free**: `Event` in, `UiEvent` out, serde on both.
@@ -198,17 +202,21 @@ Consequences, all load-bearing:
 
 ### 3.4 Protocols we own
 
-**ACP client** (~400 LOC): spawn the agent command from the registry
-(e.g. `npx @zed-industries/claude-code-acp`, `gemini --experimental-acp`); speak JSON-RPC 2.0
-over its stdio — `initialize` → `session/new` → `session/prompt`; translate
-`session/update` notifications into `SessionUpdate` events and `session/request_permission`
-into permission events (answered via `SendToAgent`). Framing is newline-delimited JSON; a
-pipe-reader edge thread parses and pushes. No async, no ACP crate — the spec is small, stable,
-and ours to track directly. Version-check at `initialize`; refuse politely on mismatch.
+**ACP client**: the official [`agent-client-protocol`](https://docs.rs/agent-client-protocol)
+crate (Apache-2.0, maintained by Zed — the spec's authors). It is **runtime-agnostic**:
+futures-based with no tokio dependency, which is why it fits this architecture — each ACP
+session gets one edge thread running a local futures executor (`futures::executor`) that owns
+the child process (agent command from the registry, e.g. `npx @zed-industries/claude-code-acp`,
+`gemini --experimental-acp`) and the connection: `initialize` → `session/new` →
+`session/prompt`. The crate's `session/update` callbacks become `SessionUpdate` events pushed
+to the engine queue; `session/request_permission` parks on a oneshot answered by a
+`SendToAgent` command. We keep a thin adapter (~150 LOC) so `helium-core` sees only our own
+event types — the crate never leaks past the edge.
 
 **Ollama agent** (~700 LOC): the same `SessionUpdate` stream produced by a native loop:
-`POST /api/chat` (streaming NDJSON over one HTTP/1.1 connection — a hand-rolled or `ureq`
-client, one edge thread per session) with a fixed tool set: `read_file`, `write_file`,
+`POST /api/chat` (streaming NDJSON via `ureq` — a real HTTP client, because real Ollama
+deployments sit behind HTTPS and reverse proxies; one edge thread per session) with a fixed
+tool set: `read_file`, `write_file`,
 `edit_file` (find/replace), `list_dir`, `grep`, `bash` (cwd locked to the worktree). Tool
 executions route through the same permission gate as ACP tool calls. Default models:
 qwen3-coder / devstral-class. The engine cannot tell an Ollama session from an ACP session.
@@ -216,6 +224,10 @@ qwen3-coder / devstral-class. The engine cannot tell an Ollama session from an A
 **Control socket**: NDJSON over `$XDG_RUNTIME_DIR/helium/<project-hash>.sock`
 (Windows: named pipe). Line in = `Event` (auth: filesystem permissions, same as QMP), line
 out = `UiEvent`. ~150 LOC including the client side used by the CLI subcommands.
+**Remote attach** (conductor on a server, cockpit at home) is SSH socket forwarding —
+`ssh -L /tmp/helium.sock:$XDG_RUNTIME_DIR/helium/<hash>.sock server` — which supplies
+authentication and encryption for free; we ship the one-liner in docs, not a network server
+in the binary.
 
 ### 3.5 Tools we shell out to
 
@@ -258,12 +270,14 @@ to the engine. gpui-component (Apache-2.0, production-proven in Longbridge Pro) 
 
 ### 3.7 Dependency budget
 
-Accepted: `gpui`, `gpui-component` (the project's raison d'être), `serde`/`serde_json`,
-`toml`, `ureq` (Ollama HTTP; may be replaced by a 150-line HTTP/1.1 client if it misbehaves),
-`notify` (worktree file-watch for diff refresh), `dirs`. Explicitly rejected: tokio (threads
-suffice), sqlite (log is the store), axum/hyper (no HTTP server), git2/gitoxide (CLI),
-octocrab (gh CLI), the ACP crate (we own the protocol). Target: **< 20 direct dependencies,
-one binary, cold start < 100 ms, idle RSS dominated by GPUI itself.**
+Accepted: `gpui`, `gpui-component` (the project's raison d'être),
+`agent-client-protocol` (official, runtime-agnostic — canonical types beat hand-rolled
+framing), `futures` (local executors on edge threads), `serde`/`serde_json`, `toml`, `ureq`
+(Ollama HTTP — TLS and proxies are table stakes, we don't hand-roll them), `notify`
+(worktree file-watch for diff refresh), `dirs`. Explicitly rejected: tokio (threads suffice),
+sqlite (log is the store), axum/hyper (no HTTP server), git2/gitoxide (CLI), octocrab (gh
+CLI). Target: **< 20 direct dependencies, one binary, cold start < 100 ms, idle RSS dominated
+by GPUI itself.**
 
 ### 3.8 Workflow file (`.helium/workflow.toml`)
 
@@ -313,7 +327,7 @@ helium/
 │   └── helium/                # bin: everything with side effects.
 │       ├── engine/            #   event loop thread, command executor, log append/replay
 │       ├── edges/             #   pipe readers, timer, git/gh/hook runners, control socket
-│       ├── acp.rs             #   JSON-RPC stdio client
+│       ├── acp.rs             #   adapter over the official agent-client-protocol crate
 │       ├── ollama.rs          #   native agent loop + HTTP client
 │       └── ui/                #   GPUI app: entities, views, actions
 └── assets/
@@ -347,9 +361,9 @@ from production incidents.
 
 - **gpui/gpui-component pre-1.0 churn** — pin exact versions; UI is a thin fold over
   `UiEvent`, so rewrites are contained by construction.
-- **ACP spec drift** — we own the client; version-check at `initialize`, integration-test
-  against claude-code-acp in CI. Owning it means we fix drift the day it happens instead of
-  waiting on a crate release.
+- **ACP spec drift** — carried by the official crate (maintained by the spec's authors);
+  our exposure is the ~150-line adapter. Version-check at `initialize`, integration-test
+  against claude-code-acp in CI.
 - **Windows quirks** (named pipes, process spawning, worktree paths, DX11 backend) — CI on all
   three OSes from milestone 2.
 - **Ollama agent quality** — local models are weaker at agentic loops; small toolset, public

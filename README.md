@@ -62,9 +62,9 @@ raises an *escalation* when a worker genuinely needs a human. Runs headless on a
   machine (`step(state, event) -> commands`) on one thread with one event queue. No async
   runtime, no locks. The event log *is* the database: state is a replay, crash recovery is a
   replay, and any bug reproduces deterministically from a `.jsonl` file.
-- **Almost no dependencies** — no tokio, no sqlite, no web framework, no git bindings. We
-  own the small protocols (ACP is ~400 lines of JSON-RPC) and shell out to the proven tools
-  (`git`, `gh`). Under 20 direct deps; GPUI is most of the binary.
+- **Almost no dependencies** — no tokio, no sqlite, no web framework, no git bindings. ACP
+  comes from the official runtime-agnostic SDK; everything else shells out to the proven
+  tools (`git`, `gh`). Under 20 direct deps; GPUI is most of the binary.
 - **Repo-local workflow file** — `.helium/workflow.toml` declares your tracker, filters,
   runners, per-state prompts, hooks (`on_working_complete = "cargo test"`), and limits.
   Your orchestration policy is code-reviewed like everything else.
