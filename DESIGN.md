@@ -2,6 +2,35 @@
 
 *Working name: **Helium** (lighter than Air). Rust-native, open-source, built on GPUI.*
 
+## 0. Design principles
+
+The whole system obeys five rules; every section below is a consequence of them.
+
+1. **One loop, one queue, one owner.** All orchestration state is owned by a single engine
+   thread running a single event loop over a single queue (the QEMU main-loop shape). No locks,
+   no shared mutable state, no async runtime. Concurrency exists only at the edges — dumb
+   threads that block on a pipe or a socket and push events into the queue.
+2. **The engine is sans-IO.** The core is a pure state machine:
+   `step(State, Event) -> Vec<Command>`. It never touches a process, socket, file, or clock —
+   time arrives as `Event::Tick`, randomness doesn't exist. IO lives in a thin shell that feeds
+   events in and executes emitted commands. The engine is therefore deterministic, replayable,
+   and testable at millions of steps per second with a fake clock.
+3. **The event log is the database.** Every event is appended to a JSONL log before it is
+   applied. State is a fold over the log; restart = replay. There is no second store to drift
+   out of sync. Snapshots are an optimization, added only if replay ever gets slow.
+4. **Own the protocols, shell out to the tools.** ACP is JSON-RPC over stdio — we implement the
+   client ourselves (~400 lines) rather than import an async ecosystem for it. Git and GitHub
+   are driven through the `git` and `gh` CLIs — stable, documented, battle-tested interfaces —
+   not through library bindings.
+5. **A dependency must pay rent.** GPUI + gpui-component are the point of the project (native
+   cross-platform GPU UI) and are accepted. Beyond them the budget is small and enumerated
+   (§3.7). Anything a competent programmer can write in a weekend at the size we need — HTTP/1.1
+   client, JSON-RPC framing, diff parsing — we write.
+
+What this buys: the hardest subsystem of the naive design (a tokio↔GPUI executor bridge) simply
+does not exist; the engine runs headless, under test, or under the GUI without changing a line;
+crash recovery is replay; and the binary stays one small artifact.
+
 ## 1. Why this should exist
 
 [JetBrains Air](https://air.dev/) (public preview, March 2026) defined a new category: the
@@ -13,17 +42,17 @@ Air is good, but its most-voiced complaints are structural, not fixable by JetBr
 
 | Air's weakness | Our answer |
 |---|---|
-| Closed source, trust deficit after Fleet's cancellation | Apache-2.0 / MIT, open from day one |
-| Kotlin/JVM — "lightweight" only relative to IntelliJ | Rust + GPUI: native GPU-rendered UI, ~15 MB binary, instant startup |
+| Closed source, trust deficit after Fleet's cancellation | MIT, open from day one |
+| Kotlin/JVM — "lightweight" only relative to IntelliJ | Rust + GPUI: native GPU-rendered UI, small single binary, instant startup |
 | No Windows (macOS + Linux only as of mid-2026) | GPUI ships Metal/Vulkan/DX11 — all three platforms from v1 |
 | No local-model support (top requested feature, "no ETA") | Built-in Ollama-backed agent |
 | Subscription lock-in (JetBrains AI credits) | BYOK / bring-your-own-agent; we never proxy tokens |
 | Coarse permission controls | Fine-grained per-task permission policies |
 
 The open-source field validates the demand but leaves the slot open:
-**Vibe Kanban** (web UI, company shut down, community-maintained), **Claude Squad** (terminal-only),
-**Crystal/Nimbalyst** (Electron), **Conductor** (polished but closed, macOS-only).
-Nobody has built the *native, cross-platform, open* one. That's the gap.
+**Vibe Kanban** (web UI, company shut down, community-maintained), **Claude Squad**
+(terminal-only), **Crystal/Nimbalyst** (Electron), **Conductor** (polished but closed,
+macOS-only). Nobody has built the *native, cross-platform, open* one. That's the gap.
 
 **[Kata Symphony](https://kata.sh/symphony)** (open-source, Rust) is the strongest design
 influence: a *headless* issue-to-PR orchestrator that polls GitHub/Linear, dispatches parallel
@@ -42,209 +71,206 @@ Two operating modes over one engine (Symphony-inspired):
 - **Cockpit mode** (interactive): you create tasks, watch the board, review diffs, approve merges.
 - **Conductor mode** (unattended): Helium polls the tracker (GitHub issues/Projects), auto-claims
   candidate issues, dispatches workers, drives each through implement → review → rework → PR,
-  and only surfaces **escalations** when a worker is blocked. The GUI is a client you attach to;
-  the same engine runs headless on a server (`helium serve`).
+  and only surfaces **escalations** when a worker is blocked. `helium --headless` runs the same
+  binary without a window; the GUI (or CLI subcommands) attach over a local control socket.
 
 **In scope:**
 1. **Kanban board** of agent tasks (To do / In progress / In review / Done), one agent session per card.
 2. **Git worktree isolation** per task — each task gets its own worktree + branch; approve-and-merge when done.
 3. **Task detail view** — live agent transcript (streamed markdown), tool-call log, and a **diff tab** reviewing the worktree against the base branch.
-4. **ACP-native agent integration** — implement the [Agent Client Protocol](https://agentclientprotocol.com) client once, get Claude Code, Gemini CLI, and every future ACP agent free. Agents are external processes speaking JSON-RPC over stdio; we spawn and manage them.
-5. **Built-in Ollama agent** — a minimal native agent loop (read/write/edit/glob/grep/bash tools with permission gates) driving local models through the Ollama API, exposed through the same internal interface as ACP agents. This is the headline differentiator.
+4. **ACP-native agent integration** — our own [Agent Client Protocol](https://agentclientprotocol.com) client; get Claude Code (via claude-code-acp), Gemini CLI, and every future ACP agent from a three-line TOML registry entry.
+5. **Built-in Ollama agent** — a minimal native agent loop (read/write/edit/glob/grep/bash tools with permission gates) driving local models through the Ollama API, exposed through the same internal interface as ACP agents. Headline differentiator.
 6. **Permission modes** per task: Ask / Auto-edit / Full-auto, plus per-request approval dialogs surfaced from ACP `session/request_permission`.
 7. **Context attachment** on task creation: files and pasted text (symbols/commits later).
-8. **GitHub integration via the `gh` CLI** — no OAuth or token handling of our own; we shell out
-   to the user's authenticated `gh`:
-   - **Push / pull / PR flow**: when a task is approved, push its branch and open a PR
-     (`gh pr create`) instead of (or in addition to) local merge; PR status, review state, and
-     CI checks (`gh pr checks`) render live on the kanban card.
-   - **Issues as tasks**: import a GitHub issue as a task (`gh issue list/view`) — its title/body
-     become the agent prompt context; the PR auto-links `Fixes #N`.
-   - **GitHub Projects (v2) sync**: two-way sync between the kanban board and a GitHub Project
-     via `gh project item-list / item-add / item-edit` — moving a card in Helium updates the
-     Project field, and remote changes are picked up on poll.
-
-9. **Task lifecycle state machine** (Symphony-style): `queued → working → review → rework →
-   ready → merged/pr-opened`, plus `blocked` (escalation) and `failed` (retry queue). Every
-   state transition is an event — logged, persisted, and rendered.
-10. **Escalations & steering**: a blocked worker raises an escalation card (question + context)
-    that the user answers to unblock; any running worker can be **steered** mid-flight with an
-    injected instruction (maps to a follow-up ACP prompt / conversation turn).
+8. **GitHub integration via the `gh` CLI** — no OAuth or token handling of our own:
+   - **Ship flow**: push the task branch, `gh pr create`; PR state, review decision, and CI
+     checks render live on the kanban card.
+   - **Issues as tasks**: import an issue as a task; its title/body become prompt context; the
+     PR auto-links `Fixes #N`.
+   - **Projects v2 sync**: two-way sync between the board and a GitHub Project (poll + reconcile).
+9. **Task lifecycle state machine**: `queued → working → review → rework* → ready →
+   pr-opened/merged`, plus `blocked` (escalation) and `failed` (retry queue). Every transition
+   is an event — logged, persisted, rendered.
+10. **Escalations & steering**: a blocked worker raises an escalation card the user answers to
+    unblock; any running worker can be **steered** mid-flight with an injected instruction.
 11. **Operational control loop**: per-project concurrency limit, retry with exponential backoff,
-    stall detection (no session events for N minutes → nudge, then escalate), structured JSONL
-    event log per task.
-12. **Repo-local workflow file** — `.helium/workflow.toml` declares tracker, candidate filter
-    (labels/status), workspace strategy, runner (agent) per state, per-state prompts, concurrency,
-    and hooks (shell commands on state transitions, e.g. `cargo test` gate before `ready`).
+    stall detection (no session events for N minutes → nudge, then escalate).
+12. **Repo-local workflow file** — `.helium/workflow.toml` declares tracker, candidate filter,
+    workspace strategy, runner per state, per-state prompts, concurrency, and hooks (shell
+    commands on state transitions, e.g. `cargo test` gate before `ready`).
 
 **Explicitly out of scope for v1** (designed to be addable later):
-embedded terminal (alacritty_terminal, v1.x), Docker/SSH isolation, cloud sandboxes, app preview,
-built-in git client beyond diff/merge, team features, Linear tracker support (GitHub first;
-tracker is a trait).
+embedded terminal, Docker/SSH isolation, cloud sandboxes, app preview, built-in git client
+beyond diff/merge, team features, Linear tracker (GitHub first; tracker is a trait).
 
 ## 3. Architecture
 
-### 3.0 Headless-first (the Symphony rule)
+### 3.1 Process shape
 
-The orchestration engine is a library with **zero UI dependencies**. Everything — task state
-machine, agent sessions, git, gh, tracker polling, control loop — lives in the engine and
-communicates exclusively through a typed command/event API. Two hosts consume it:
-
-- **Embedded**: the GPUI app runs the engine in-process (default desktop experience).
-- **Server**: `helium serve --port …` runs the same engine headless; the GPUI app (and a minimal
-  CLI: `helium status|steer|escalations`) attaches over HTTP + SSE using the same command/event
-  types. Unattended conductor mode on a box, cockpit at home.
-
-This costs one serialization boundary and buys: testability without a GUI, a CLI for free,
-remote operation, and immunity of core logic to gpui API churn.
-
-### 3.1 The concurrency spine
-
-GPUI runs its own smol-based executors; tokio futures panic inside `cx.spawn`. The ACP crate,
-reqwest (Ollama), and process management all want tokio. So:
-
-- One **dedicated tokio runtime** on background threads owns all I/O: agent child processes, ACP
-  JSON-RPC sessions, HTTP to Ollama, git operations.
-- The GPUI side talks to it via channels: commands in (`tokio::mpsc::UnboundedSender<Command>`),
-  events out. Events are pumped into GPUI with `cx.spawn` + `smol` channel adapters (or
-  `cx.background_executor` polling an async-channel receiver) and dispatched to entities via
-  `Entity::update`, which triggers re-render.
-- Rule: **no blocking or tokio-dependent call ever runs on the GPUI thread.**
+One binary. Threads, not runtimes:
 
 ```
-┌─────────────── GPUI main thread ───────────────┐
-│  Workspace ─ KanbanBoard ─ TaskDetail ─ Diff   │
-│        Entity<TaskStore>, Entity<Task>          │
-└───────────────▲───────────────┬────────────────┘
-        events  │               │ commands
-┌───────────────┴───────────────▼────────────────┐
-│         helium-engine (tokio runtime)           │
-│  ControlLoop: dispatch, concurrency, retries,   │
-│    stall detection, escalations, hooks          │
-│  TaskStateMachine (queued→working→review→…)     │
-│  AgentManager ── AcpSession (per task)          │
-│              └── OllamaAgent (per task)         │
-│  Tracker (gh: issues/Projects poll+reconcile)   │
-│  GitService (worktrees, diffs, merge)           │
-│  Store (sqlite + JSONL event log)               │
-└──────────────────────▲──────────────────────────┘
-                       │ same command/event API over HTTP+SSE
-              helium serve ⇄ remote cockpit / helium-cli
+┌────────────────────────── helium (one process) ─────────────────────────┐
+│                                                                          │
+│  GPUI main thread            engine thread              edge threads     │
+│  ┌──────────────────┐   cmds  ┌──────────────────┐      ┌─────────────┐  │
+│  │ Workspace         │ ─────▶ │  loop {           │ ◀──  │ pipe reader │  │
+│  │  KanbanBoard      │        │    ev = q.recv()  │      │ (per agent  │  │
+│  │  TaskDetail/Diff  │ ◀───── │    log.append(ev) │      │  stdout/err)│  │
+│  │  Escalations      │  evs   │    cmds =         │      ├─────────────┤  │
+│  └──────────────────┘         │      step(st, ev) │      │ timer       │  │
+│         ▲                     │    exec(cmds)     │      ├─────────────┤  │
+│         │ Entity updates      │  }                │      │ gh/git/hook │  │
+│   (foreground executor)       └──────────────────┘      │ runners     │  │
+│                                       ▲                  ├─────────────┤  │
+│                                       │                  │ ctl socket  │  │
+│                                       └── one mpsc queue │ (NDJSON)    │  │
+│                                                          └─────────────┘  │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 Workspace layout
+- **Engine thread**: owns all `State`, runs the loop. `step()` is the sans-IO core
+  (`helium-core`); `exec()` is the IO shell — it spawns processes, writes to stdin pipes,
+  starts edge threads, appends to logs.
+- **Edge threads** are disposable and dumb: block on one fd or one command, translate bytes
+  into typed `Event`s, push to the queue, die. A stuck agent process can never wedge the
+  engine — the reader thread blocks, the engine keeps looping (and its `Tick` handler is what
+  notices the stall).
+- **GPUI thread**: subscribes to the engine's event broadcast (a channel drained via
+  `cx.spawn` on GPUI's own executor — no foreign runtime, no bridge), applies events to
+  `Entity<_>` view models, sends commands back. The UI is a *client* of the engine, in-process.
+- **Headless / attach**: `helium --headless` is the same process minus the GPUI thread. The
+  control socket (§3.5) speaks the identical command/event types as NDJSON over a Unix socket
+  (named pipe on Windows) — QMP-style. `helium status|steer|escalations` and a remote cockpit
+  are just socket clients. No HTTP server, no SSE, no web framework.
 
-```
-helium/
-├── Cargo.toml                # workspace
-├── crates/
-│   ├── helium/               # bin: GPUI app (cockpit) — embeds engine or attaches to a server
-│   ├── helium-cli/           # bin: `helium serve|status|steer|escalations` (headless + remote control)
-│   ├── helium-core/          # Task, lifecycle states, Transcript, events, workflow/config types (no UI/IO deps)
-│   ├── helium-engine/        # tokio runtime, task state machine, control loop (concurrency,
-│   │                         #   retries/backoff, stall detection, escalations, hooks), AgentManager,
-│   │                         #   tracker polling/dispatch; exposes command/event API + HTTP/SSE server
-│   ├── helium-acp/           # ACP client: spawn agent process, JSON-RPC session, permission callbacks
-│   ├── helium-ollama/        # built-in agent: tool loop, tool impls, Ollama HTTP client
-│   ├── helium-git/           # worktree lifecycle, branch naming, diff, merge (gitoxide + git CLI fallback)
-│   ├── helium-gh/            # GitHub via `gh` CLI: PRs, checks, issues, Projects v2 sync (tracker impl)
-│   └── helium-store/         # sqlite (rusqlite) persistence: tasks, transcripts, event log, settings
-└── assets/                   # icons, themes
-```
-
-### 3.3 Agent abstraction
-
-One trait, two implementations:
+### 3.2 The sans-IO core (`helium-core`)
 
 ```rust
-trait AgentSession: Send {
-    async fn prompt(&mut self, blocks: Vec<ContentBlock>) -> Result<()>;
-    async fn cancel(&mut self) -> Result<()>;
-    fn events(&mut self) -> impl Stream<Item = SessionEvent>; // text deltas, tool calls,
-                                                              // permission requests, plan updates, done
+// The entire engine contract:
+pub fn step(state: &mut State, event: Event, now: Instant) -> Vec<Command>;
+
+pub enum Event {
+    // user/UI intents (also arrive from the control socket)
+    CreateTask { spec: TaskSpec },
+    Approve { task: TaskId }, Answer { task: TaskId, text: String },
+    Steer { task: TaskId, instruction: String }, Cancel { task: TaskId },
+    // edges reporting back
+    AgentOutput { task: TaskId, chunk: SessionUpdate },   // parsed ACP/Ollama updates
+    ProcExited { task: TaskId, code: i32 },
+    GitDone { task: TaskId, op: GitOp, result: Result<String, String> },
+    GhDone { op: GhOp, result: Result<Json, String> },
+    HookDone { task: TaskId, hook: String, code: i32, stderr: String },
+    Tick,                                                  // 1 Hz; drives timeouts, backoff, polls
+}
+
+pub enum Command {
+    SpawnAgent { task: TaskId, runner: RunnerCfg, worktree: PathBuf },
+    SendToAgent { task: TaskId, msg: Json },               // prompt / permission reply / cancel
+    KillAgent { task: TaskId },
+    Git { task: TaskId, op: GitOp },                       // worktree add/remove, diff, merge, push
+    Gh { op: GhOp },                                       // pr create/view, issue list, project ops
+    RunHook { task: TaskId, hook: String, cmd: String },
+    Emit { event: UiEvent },                               // broadcast to UI + control socket
 }
 ```
 
-- **`AcpAgentSession`** (helium-acp): spawns the configured agent command (e.g.
-  `npx @zed-industries/claude-code-acp`, `gemini --experimental-acp`), runs
-  `initialize → session/new → session/prompt` over stdio JSON-RPC via the official
-  `agent-client-protocol` Rust crate. `session/update` notifications become `SessionEvent`s;
-  `session/request_permission` becomes a `SessionEvent::PermissionRequest` that blocks on a
-  oneshot answered from the UI (or auto-answered by the task's permission mode).
-- **`OllamaAgentSession`** (helium-ollama): a classic tool-use loop against
-  `POST /api/chat` with `tools`: send conversation → model returns tool calls → execute
-  (through the same permission gate) → append results → repeat until a plain message.
-  v1 toolset: `read_file`, `write_file`, `edit_file` (find/replace), `list_dir`, `grep`,
-  `bash` (cwd locked to the worktree). Recommended default models: qwen3-coder / devstral-class.
+Consequences, all load-bearing:
+- **Every feature in §2.9–2.11 is pure code in `step()`**: the lifecycle machine, retry
+  backoff, stall detection (compare `last_activity` against `now` on `Tick`), rework cycles,
+  concurrency caps, tracker-poll scheduling. All of it unit-tests with synthetic events and a
+  fake clock — no processes, no git repos, no network.
+- **Replay is trivial**: `state = events.fold(State::default(), step_ignoring_commands)`.
+  Startup, crash recovery, and "reopen a 3-week-old task" are the same code path.
+- **The control protocol falls out for free**: `Event` in, `UiEvent` out, serde on both.
 
-The UI never knows which kind it's driving.
+### 3.3 The event log is the database
 
-### 3.4 Git layer
+- Per project: `.helium/log/<task-id>.jsonl` (session events) + `.helium/log/engine.jsonl`
+  (task-level transitions, dispatch decisions). Append-only, fsync'd on state transitions,
+  line-buffered otherwise.
+- Startup: replay `engine.jsonl` (small — transitions only) to rebuild the board; a task's
+  transcript replays lazily when its detail view opens.
+- No sqlite, no schema migrations, no cache invalidation. `grep`/`jq` are the debug tools.
+  If a log is corrupted (torn final line), we truncate to the last valid line and continue.
+- Config: `~/.config/helium/config.toml` (agent registry, theme) + `.helium/workflow.toml`
+  (per-repo policy). Both are data; adding an ACP agent is three lines of TOML.
 
-- Worktree per task: `git worktree add .helium/worktrees/<task-slug> -b helium/<task-slug> <base>`.
-  Prefer shelling out to the `git` CLI for worktree/merge (worktree support in libraries is the
-  weakest corner; the CLI is what Vibe Kanban and Claude Squad ship on), **gitoxide** for fast
-  read-side ops (status, diff enumeration).
-- Diff tab renders `base...worktree` unified diffs (recomputed on file-change events, debounced).
-- Merge flow: squash-merge or plain merge back to base branch, then
-  `git worktree remove` + branch cleanup. Conflicts → surface and leave the worktree for manual fixing.
+### 3.4 Protocols we own
 
-### 3.4b GitHub layer (helium-gh)
+**ACP client** (~400 LOC): spawn the agent command from the registry
+(e.g. `npx @zed-industries/claude-code-acp`, `gemini --experimental-acp`); speak JSON-RPC 2.0
+over its stdio — `initialize` → `session/new` → `session/prompt`; translate
+`session/update` notifications into `SessionUpdate` events and `session/request_permission`
+into permission events (answered via `SendToAgent`). Framing is newline-delimited JSON; a
+pipe-reader edge thread parses and pushes. No async, no ACP crate — the spec is small, stable,
+and ours to track directly. Version-check at `initialize`; refuse politely on mismatch.
 
-All GitHub access shells out to the user's **`gh` CLI** — Helium never stores or requests
-tokens. On startup we probe `gh auth status`; if absent, GitHub features grey out with a
-"run `gh auth login`" hint (everything local keeps working — GitHub is an enhancement, not
-a requirement).
+**Ollama agent** (~700 LOC): the same `SessionUpdate` stream produced by a native loop:
+`POST /api/chat` (streaming NDJSON over one HTTP/1.1 connection — a hand-rolled or `ureq`
+client, one edge thread per session) with a fixed tool set: `read_file`, `write_file`,
+`edit_file` (find/replace), `list_dir`, `grep`, `bash` (cwd locked to the worktree). Tool
+executions route through the same permission gate as ACP tool calls. Default models:
+qwen3-coder / devstral-class. The engine cannot tell an Ollama session from an ACP session.
 
-- **Structured output everywhere**: every call uses `--json`/`--format json`
-  (`gh pr view --json state,statusCheckRollup,reviewDecision`, `gh project item-list --format json`)
-  parsed with serde into typed structs in `helium-core`. No screen-scraping.
-- **Ship flow**: approve task → `git push -u origin helium/<slug>` → `gh pr create --fill --head …`
-  (title/body drafted from the task prompt + agent summary, `Fixes #N` when the task came from
-  an issue). Card then tracks the PR: state, review decision, and check rollup polled via
-  `gh pr view` on a backend interval (~60s, plus manual refresh).
-- **Issues as tasks**: "New task from issue" lists open issues (`gh issue list --json`), and the
-  selected issue's title/body/labels are attached as prompt context.
-- **Projects v2 sync** (opt-in per project, config maps board columns ↔ the Project's Status
-  field options): local card moves call `gh project item-edit`; a poll of `gh project item-list`
-  reconciles remote moves. Conflict rule: **last-writer-wins, remote preferred** — the board is a
-  view over GitHub, not a second source of truth. Requires the `project` scope
-  (`gh auth refresh -s project`); we detect the missing-scope error and show the exact command.
-- All `gh` invocations run on the tokio runtime through a single rate-limit-aware queue
-  (serialized per repo, exponential backoff on 4xx/secondary-rate-limit errors), emitting the
-  same backend events the UI already consumes.
+**Control socket**: NDJSON over `$XDG_RUNTIME_DIR/helium/<project-hash>.sock`
+(Windows: named pipe). Line in = `Event` (auth: filesystem permissions, same as QMP), line
+out = `UiEvent`. ~150 LOC including the client side used by the CLI subcommands.
 
-### 3.4c Control loop & lifecycle (helium-engine)
+### 3.5 Tools we shell out to
 
-The heart of conductor mode, and cockpit mode uses the same machinery with manual dispatch:
+**git** — worktrees (`git worktree add .helium/worktrees/<slug> -b helium/<slug> <base>`),
+diffs (`git diff <base>...` parsed into hunks — the unified format is a stable interface),
+status (`--porcelain=v2`), merge, push, cleanup (`git worktree remove` + branch delete;
+conflicts surface as an escalation and leave the worktree for manual fixing). No git library:
+the CLI is the one interface every git feature is guaranteed to support, and it's what the
+proven orchestrators (Vibe Kanban, Claude Squad) ship on.
 
-- **Lifecycle**: `queued → working → review → rework* → ready → pr-opened/merged`, with
-  `blocked` and `failed` as side states. `review` runs a configurable gate: hooks (e.g. build/test
-  commands) and optionally a second agent session prompted as reviewer; findings send the task to
-  `rework` with the review output as the next prompt. Max rework cycles before escalating.
-- **Dispatch**: tracker poll (`gh issue list` / `gh project item-list`) → candidate filter from
-  `workflow.toml` (labels, status column, assignee) → claim (move Project status, comment on
-  issue) → create worktree → start agent session. Respects `max_concurrent_workers`.
-- **Retries**: failed sessions (process death, API errors) re-queue with exponential backoff and
-  a retry cap; the retry queue is visible in the UI.
-- **Stall detection**: no session events for `stall_after` (default 10 min) → inject a nudge
-  prompt; still silent → mark `blocked` with an auto-generated escalation.
-- **Escalations**: a first-class queue. Each carries the agent's question (or the stall/failure
-  context) and accepts a text answer, which resumes the session as the next prompt turn.
-- **Steering**: `steer(task, instruction)` cancels the in-flight turn if needed and injects the
-  instruction as a user turn — works identically for ACP and Ollama sessions.
-- **Hooks**: shell commands on state transitions (`on_working_complete = "cargo test"`,
-  `on_ready = "./notify.sh"`), run in the task's worktree; non-zero exit routes to `rework`
-  with stderr as context.
-- **Structured logs**: every event appended to `.helium/logs/<task>.jsonl` — replayable,
-  greppable, and the source for the transcript view after restarts.
+**gh** — all GitHub access rides the user's authenticated `gh`; Helium never stores tokens.
+Probe `gh auth status` at startup; without it, GitHub features grey out and everything local
+still works. Every call uses `--json`/`--format json` into typed structs — no screen-scraping.
+Ship flow: `git push -u origin helium/<slug>` → `gh pr create --fill` (body drafted from task
+prompt + agent summary, `Fixes #N` when issue-born) → card tracks
+`gh pr view --json state,statusCheckRollup,reviewDecision` on a poll driven by `Tick`.
+Issues-as-tasks: `gh issue list/view --json`. Projects v2 sync: column ↔ Status-field mapping
+from `workflow.toml`; local moves call `gh project item-edit`, a reconcile poll applies remote
+moves; conflict rule: **remote wins** — the board is a view over GitHub, not a second source of
+truth. Missing `project` scope is detected and answered with the exact
+`gh auth refresh -s project` command. One serialized queue per repo with exponential backoff
+on rate-limit errors — scheduled by `step()`, executed by a runner thread.
 
-### 3.4d Workflow file (`.helium/workflow.toml`)
+### 3.6 UI (GPUI + gpui-component)
+
+The UI holds **no business state** — view models are folds over `UiEvent`s, commands go back
+to the engine. gpui-component (Apache-2.0, production-proven in Longbridge Pro) supplies:
+
+| Screen | Widgets |
+|---|---|
+| Workspace shell | `Dock` layout, `Sidebar` (projects), titlebar, theme switcher |
+| Kanban board | columns via `VirtualList`; card = status badge, agent icon, branch, turn count, PR state + CI pill |
+| New task form | `Form`, `Input`, agent `Select`, base-branch `Select`, permission-mode radio, file-context picker |
+| Task detail — transcript | Markdown `TextView` stream, tool-call accordion rows, prompt `Input` |
+| Task detail — diff | file `Tree` + read-only `Editor` (tree-sitter) rendering parsed hunks |
+| Permission prompts | `Dialog` + `Notification` toasts |
+| Escalation queue | `Sidebar` section + badge; card = question, context, answer `Input` |
+| Operations tab | retry/blocked queues as `DataTable` (Symphony's console, native) |
+| Settings | agent registry, Ollama endpoint/model, workflow editor, defaults |
+
+### 3.7 Dependency budget
+
+Accepted: `gpui`, `gpui-component` (the project's raison d'être), `serde`/`serde_json`,
+`toml`, `ureq` (Ollama HTTP; may be replaced by a 150-line HTTP/1.1 client if it misbehaves),
+`notify` (worktree file-watch for diff refresh), `dirs`. Explicitly rejected: tokio (threads
+suffice), sqlite (log is the store), axum/hyper (no HTTP server), git2/gitoxide (CLI),
+octocrab (gh CLI), the ACP crate (we own the protocol). Target: **< 20 direct dependencies,
+one binary, cold start < 100 ms, idle RSS dominated by GPUI itself.**
+
+### 3.8 Workflow file (`.helium/workflow.toml`)
 
 ```toml
 [tracker]
-kind = "github"                # trait-based; linear later
-project = "acme/webapp#3"      # Projects v2 board
+kind = "github"
+project = "acme/webapp#3"
 candidate_filter = { labels = ["agent-ok"], status = "Todo" }
 
 [workspace]
@@ -273,65 +299,80 @@ mode = "pr"                    # pr | merge
 draft = true
 ```
 
-### 3.5 UI (gpui-component mapping)
+## 4. Crate layout
 
-| Screen | Widgets |
-|---|---|
-| Workspace shell | `Dock` layout, `Sidebar` (projects), titlebar, theme switcher (20+ built-in themes) |
-| Kanban board | columns of cards via `VirtualList`; card = status badge, agent icon, branch, cost/turn count, PR state + CI check pill |
-| New task form | `Form`, `Input`, agent `Select`, base-branch `Select`, permission-mode radio, file-context picker |
-| Task detail — transcript | Markdown `TextView` stream, tool-call accordion rows, sticky prompt `Input` at bottom |
-| Task detail — diff | file tree (`Tree`) + per-file diff using the `Editor` component (tree-sitter highlighting) in read-only two-tone mode |
-| Permission prompts | `Dialog` (blocking request) + `Notification` toasts for background events |
-| Escalation queue | dedicated `Sidebar` section + badge count; escalation card = question, context excerpt, answer `Input` |
-| Steering | command palette action / per-card button → `Dialog` with instruction input |
-| Retry/blocked queues | `DataTable` views under an "Operations" tab (mirrors Symphony's console) |
-| Settings | agent registry editor (name, command, args, env), Ollama endpoint/model, workflow.toml editor, defaults |
+Two crates. Split further only when compile times or ownership demand it.
 
-### 3.6 Persistence & config
+```
+helium/
+├── Cargo.toml                 # workspace
+├── crates/
+│   ├── helium-core/           # sans-IO: State, Event, Command, step(); deps: serde only.
+│   │                          #   lifecycle, control loop, dispatch policy, permission policy —
+│   │                          #   the whole brain, fully deterministic, fuzzable.
+│   └── helium/                # bin: everything with side effects.
+│       ├── engine/            #   event loop thread, command executor, log append/replay
+│       ├── edges/             #   pipe readers, timer, git/gh/hook runners, control socket
+│       ├── acp.rs             #   JSON-RPC stdio client
+│       ├── ollama.rs          #   native agent loop + HTTP client
+│       └── ui/                #   GPUI app: entities, views, actions
+└── assets/
+```
 
-- **sqlite** (`rusqlite`, bundled) at the project level (`.helium/state.db`): tasks, status,
-  transcript events (append-only), token/cost tallies. Survives restarts; sessions are
-  resumable where the agent supports `session/load`.
-- **Config**: global `~/.config/helium/config.toml` (agent registry, theme, defaults) +
-  optional per-repo `.helium/config.toml`. Agent registry is data, not code — adding an ACP
-  agent is three lines of TOML.
+## 5. Milestones
 
-## 4. Milestones
+Each independently verifiable; `helium-core` grows tests from milestone 1.
 
-Each independently runnable/verifiable:
+1. **Core + replay** — `helium-core` with lifecycle machine, `step()`, event log
+   append/replay; property tests (random event sequences never violate state invariants) and
+   fake-clock tests for backoff/stall. No UI, no processes. *(medium — but it's the brain)*
+2. **Skeleton** — GPUI window, dock, empty kanban fed by a scripted engine replaying a canned
+   log. Proves UI-as-fold-over-events. *(small)*
+3. **ACP client** — drive claude-code-acp end-to-end: create task → prompt → streamed
+   transcript → tool-call rendering → permission dialog → cancel → steer. *(large — the heart)*
+4. **Worktrees + diff** — worktree/branch per task, diff tab, merge & cleanup. *(medium)*
+5. **GitHub via `gh`** — auth probe, push + PR ship flow, checks on cards, issue→task import. *(medium)*
+6. **Conductor mode** — `workflow.toml`, tracker poll + dispatch, Projects sync, hooks,
+   `--headless` + control socket + CLI subcommands. Mostly `step()` logic already tested in
+   milestone 1; this wires the edges. *(medium)*
+7. **Ollama agent** — tool loop, permission gates, model picker, reviewer role. *(large)*
+8. **Polish & release** — Gemini preset, settings UI, packaging (cargo-bundle / MSI /
+   AppImage), docs, CI on all three platforms. *(medium)*
 
-1. **Skeleton** — workspace compiles; GPUI window with dock layout, theme, empty kanban. *(small)*
-2. **Engine spine** — headless `helium-engine` with tokio runtime, command/event API, task state machine; fake "echo agent" streams text into a task card's transcript. Engine has integration tests with no GUI. *(medium)*
-3. **ACP client** — drive claude-code-acp end-to-end: create task → prompt → streamed transcript → tool-call rendering → permission dialog → cancel → steer. *(large — the heart)*
-4. **Worktrees + diff** — task creation makes a worktree/branch; diff tab; merge & cleanup flow. *(medium)*
-5. **Lifecycle + persistence** — full state machine (review/rework/blocked/failed), sqlite store + JSONL event logs, restart-safe. *(medium)*
-6. **GitHub via `gh`** — auth probe, push + `gh pr create` ship flow, PR/checks status on cards, issue→task import. *(medium)*
-7. **Conductor mode** — `workflow.toml`, tracker polling + candidate dispatch, Projects v2 two-way sync, control loop (concurrency, retries, stall detection, escalations, hooks), `helium serve` + HTTP/SSE attach + minimal CLI. *(large)*
-8. **Ollama agent** — tool loop, permission gates, model picker; parity in the UI incl. per-state reviewer role. *(large)*
-9. **Polish & release** — Gemini CLI config preset, settings UI, packaging (cargo-bundle / MSI / AppImage), docs, CI for the three platforms. *(medium)*
+Milestone 1 is deliberately first: in this architecture the orchestrator is *finished and
+tested before it ever touches IO*. Symphony-grade operational behavior comes from tests, not
+from production incidents.
 
-Milestone 3 is the risk concentrator — do it early, everything else is conventional.
+## 6. Risks
 
-## 5. Risks
+- **gpui/gpui-component pre-1.0 churn** — pin exact versions; UI is a thin fold over
+  `UiEvent`, so rewrites are contained by construction.
+- **ACP spec drift** — we own the client; version-check at `initialize`, integration-test
+  against claude-code-acp in CI. Owning it means we fix drift the day it happens instead of
+  waiting on a crate release.
+- **Windows quirks** (named pipes, process spawning, worktree paths, DX11 backend) — CI on all
+  three OSes from milestone 2.
+- **Ollama agent quality** — local models are weaker at agentic loops; small toolset, public
+  and tunable system prompt, honest docs (it shines as reviewer / small-task worker).
+- **`gh`/`git` output drift** — pin minimum versions, parse only `--json`/porcelain
+  interfaces, integration-test the parsers in CI, degrade gracefully when absent.
+- **No accessibility in GPUI** — known ecosystem gap; document, track upstream.
+- **Event log growth** — transcripts are append-only JSONL per task; rotate on task
+  completion (archive dir), snapshot `engine.jsonl` if replay ever exceeds ~50 ms.
 
-- **gpui/gpui-component pre-1.0 churn** — pin exact versions, upgrade deliberately; keep UI code thin over `helium-core` types so rewrites are contained.
-- **ACP spec drift** — track the official crate version; integration-test against claude-code-acp in CI.
-- **Windows quirks** (GPUI newest backend; git worktree paths, process spawning) — CI on all three OSes from milestone 1, not at the end.
-- **Ollama agent quality** — local models are weaker at agentic loops; scope the toolset small, make the system prompt public and tunable, set expectations in docs (it's for smaller tasks / privacy-sensitive work).
-- **No accessibility in GPUI** — known ecosystem gap; document it, track upstream.
-- **`gh` CLI as a dependency** — output schemas can shift between gh versions and Projects v2
-  commands need an extra auth scope; pin a minimum gh version, integration-test the JSON
-  parsing in CI, and degrade gracefully when gh is missing or under-scoped.
+## 7. What makes the loved tools loved (design north stars)
 
-## 6. What makes the loved tools loved (design north stars)
-
-From user sentiment around Air, Conductor, Vibe Kanban, Claude Squad:
-
-1. **Instant, glanceable status** — you look at the board and know which agent needs you. Optimize for the *review* moment, not the launch moment.
-2. **Worktree isolation that never bites** — cleanup must be bulletproof; orphaned worktrees are the #1 trust killer in this category.
-3. **Frictionless task launch** — one keystroke from "idea" to "agent running" (global new-task shortcut, sensible defaults).
-4. **Real diffs, not walls of text** — reviewing the change matters more than reading the transcript.
-5. **Respecting the user's stack** — BYO agent, BYO keys, BYO editor ("Open in $EDITOR" on every worktree).
-6. **Being native and fast** — Conductor wins praise purely for feeling like a real Mac app; GPUI gives us that on all three platforms.
-7. **Unattended must mean unattended** (Symphony's lesson) — retries, stall detection, and escalations make it safe to walk away; a tool you have to babysit is just a slower terminal.
+1. **Instant, glanceable status** — you look at the board and know which agent needs you.
+   Optimize for the *review* moment, not the launch moment.
+2. **Worktree isolation that never bites** — cleanup must be bulletproof; orphaned worktrees
+   are the #1 trust killer in this category.
+3. **Frictionless task launch** — one keystroke from "idea" to "agent running".
+4. **Real diffs, not walls of text** — reviewing the change matters more than the transcript.
+5. **Respecting the user's stack** — BYO agent, BYO keys, BYO editor ("Open in $EDITOR" on
+   every worktree).
+6. **Being native and fast** — Conductor wins praise purely for feeling like a real Mac app;
+   GPUI gives us that on all three platforms.
+7. **Unattended must mean unattended** (Symphony's lesson) — retries, stall detection, and
+   escalations make it safe to walk away; a tool you babysit is just a slower terminal.
+8. **Comprehensible when it breaks** (the Bellard clause) — one loop to read, one log to
+   `jq`, one deterministic replay to reproduce any bug. Simplicity is an operational feature.

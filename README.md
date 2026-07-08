@@ -45,7 +45,7 @@ open a PR with one action.
 candidate issues, claims them, dispatches workers under a concurrency cap, drives each through
 **implement → review → rework → PR**, retries failures with backoff, detects stalls, and
 raises an *escalation* when a worker genuinely needs a human. Runs headless on a server
-(`helium serve`); the desktop app attaches to it like a cockpit to an engine.
+(`helium --headless`); the desktop app and CLI attach over a local control socket.
 
 ### Under the hood
 
@@ -58,8 +58,13 @@ raises an *escalation* when a worker genuinely needs a human. Runs headless on a
   over files; cleanup is bulletproof.
 - **GitHub through `gh`** — PRs, checks, issues, and Projects v2 sync ride your existing
   `gh auth login`. Helium never sees a token.
-- **Headless-first engine** — the orchestrator is a UI-free Rust library with a typed
-  command/event API. The GPUI app, the CLI, and the server are all just clients.
+- **A sans-IO engine you can read in an afternoon** — the orchestrator is a pure state
+  machine (`step(state, event) -> commands`) on one thread with one event queue. No async
+  runtime, no locks. The event log *is* the database: state is a replay, crash recovery is a
+  replay, and any bug reproduces deterministically from a `.jsonl` file.
+- **Almost no dependencies** — no tokio, no sqlite, no web framework, no git bindings. We
+  own the small protocols (ACP is ~400 lines of JSON-RPC) and shell out to the proven tools
+  (`git`, `gh`). Under 20 direct deps; GPUI is most of the binary.
 - **Repo-local workflow file** — `.helium/workflow.toml` declares your tracker, filters,
   runners, per-state prompts, hooks (`on_working_complete = "cargo test"`), and limits.
   Your orchestration policy is code-reviewed like everything else.
@@ -71,12 +76,12 @@ lifecycle, the task state machine, and the milestone plan — lives in
 **[DESIGN.md](DESIGN.md)**. The short version:
 
 ```
-GPUI cockpit / CLI  ⇄  command/event API  ⇄  helium-engine (tokio)
-                                              ├─ control loop: dispatch, retries,
-                                              │    stall detection, escalations, hooks
-                                              ├─ agent sessions: ACP · Ollama
-                                              ├─ git worktrees · gh (PRs, Projects)
-                                              └─ sqlite + JSONL event log
+GPUI cockpit / CLI / socket  ⇄  events in, commands out  ⇄  engine thread (one loop)
+                                                             ├─ step(): lifecycle, dispatch,
+                                                             │   retries, stalls, escalations
+                                                             ├─ edges: ACP stdio · Ollama HTTP
+                                                             │   · git · gh · hooks (plain threads)
+                                                             └─ JSONL event log (= the database)
 ```
 
 ## Status
@@ -84,8 +89,8 @@ GPUI cockpit / CLI  ⇄  command/event API  ⇄  helium-engine (tokio)
 Helium is in the **design phase** — the blueprint is public before the code, on purpose.
 Read [DESIGN.md](DESIGN.md), open an issue, tell us where we're wrong.
 
-Roadmap (abridged): GPUI skeleton → headless engine → ACP client → worktrees & diff review →
-lifecycle & persistence → `gh` ship flow → conductor mode → Ollama agent → v1.
+Roadmap (abridged): sans-IO core (tested before it touches IO) → GPUI skeleton → ACP client →
+worktrees & diff review → `gh` ship flow → conductor mode → Ollama agent → v1.
 
 ## Inspiration
 
